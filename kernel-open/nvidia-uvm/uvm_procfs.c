@@ -31,6 +31,7 @@
 #define UVM_PROC_DIR_NAME "driver/nvidia-uvm"
 #define UVM_PROC_GPUS_DIR_NAME "gpus"
 #define UVM_PROC_CPU_DIR_NAME "cpu"
+#define UVM_PROC_ESCAL_DIR_NAME "escal"
 
 #if defined(CONFIG_PROC_FS)
   // This parameter enables additional debug procfs entries. It's enabled by
@@ -45,6 +46,7 @@
 static struct proc_dir_entry *uvm_proc_dir;
 static struct proc_dir_entry *uvm_proc_gpus;
 static struct proc_dir_entry *uvm_proc_cpu;
+static struct proc_dir_entry *uvm_proc_escal;
 
 NV_STATUS uvm_procfs_init()
 {
@@ -60,6 +62,10 @@ NV_STATUS uvm_procfs_init()
         return NV_ERR_OPERATING_SYSTEM;
 
     uvm_proc_cpu = NV_CREATE_PROC_DIR(UVM_PROC_CPU_DIR_NAME, uvm_proc_dir);
+    if (uvm_proc_cpu == NULL)
+        return NV_ERR_OPERATING_SYSTEM;
+
+    uvm_proc_escal = NV_CREATE_PROC_DIR(UVM_PROC_ESCAL_DIR_NAME, uvm_proc_dir);
     if (uvm_proc_cpu == NULL)
         return NV_ERR_OPERATING_SYSTEM;
 
