@@ -40,6 +40,7 @@
 #include "uvm_migrate_pageable.h"
 #include "uvm_va_space_mm.h"
 #include "nv_speculation_barrier.h"
+#include "uvm_escal_monitor.h"
 
 typedef enum
 {
@@ -862,6 +863,8 @@ NV_STATUS uvm_api_migrate(UVM_MIGRATE_PARAMS *params, struct file *filp)
     bool flush_events = false;
     const bool synchronous = !(params->flags & UVM_MIGRATE_FLAG_ASYNC);
 
+
+
     // We temporarily allow 0 length in the IOCTL parameters as a signal to
     // only release the semaphore. This is because user-space is in charge of
     // migrating pageable memory in some cases.
@@ -885,6 +888,8 @@ NV_STATUS uvm_api_migrate(UVM_MIGRATE_PARAMS *params, struct file *filp)
     // mmap_lock will be needed if we have to create CPU mappings
     mm = uvm_va_space_mm_or_current_retain_lock(va_space);
     uvm_va_space_down_read(va_space);
+
+
 
     if (synchronous) {
         if (params->semaphoreAddress != 0) {
@@ -932,16 +937,26 @@ NV_STATUS uvm_api_migrate(UVM_MIGRATE_PARAMS *params, struct file *filp)
     if (synchronous || params->semaphoreAddress)
         tracker_ptr = &tracker;
 
+	UVM_ESCAL_PRINT("synchronous[%d] base[0x%x] lenght[0x%x] destinationUuid[0x%x] flags[0x%x] seAddr[0x%x] sePay[0x%x] cpuNuMd[0x%x]\n",\
+			synchronous, params->base, params->length, params->destinationUuid, params->flags, params->semaphoreAddress, params->semaphorePayload, params->cpuNumaNode);
+
     if (params->length > 0) {
-        uvm_api_range_type_t type;
-
-        type = uvm_api_range_type_check(va_space, mm, params->base, params->length);
-        if (type == UVM_API_RANGE_TYPE_INVALID) {
-            status = NV_ERR_INVALID_ADDRESS;
-            goto done;
-        }
-
-        if (type == UVM_API_RANGE_TYPE_ATS) {
+        status = uvm_api_range_type_check(va_space, mm, params->base, params->length);
+        if (status == NV_OK) {
+            status = uvm_migrate(va_space,
+                                 mm,
+                                 params->base,
+                                 params->length,
+                                 (dest_gpu ? dest_gpu->id : UVM_ID_CPU),
+                                 params->flags,
+                                 uvm_va_space_iter_first(va_space,
+                                                         params->base,
+                                                         params->base),
+                                 tracker_ptr);
+        
+			UVM_ESCAL_PRINT("status OK case. dest_gpu[0x%x]\n", dest_gpu);
+		}
+        else if (status == NV_WARN_NOTHING_TO_DO) {
             uvm_migrate_args_t uvm_migrate_args =
             {
                 .va_space               = va_space,
@@ -955,21 +970,11 @@ NV_STATUS uvm_api_migrate(UVM_MIGRATE_PARAMS *params, struct file *filp)
                 .skip_mapped            = false,
                 .user_space_start       = &params->userSpaceStart,
                 .user_space_length      = &params->userSpaceLength,
-            };
+			};
 
-            status = uvm_migrate_pageable(&uvm_migrate_args);
-        }
-        else {
-            status = uvm_migrate(va_space,
-                                 mm,
-                                 params->base,
-                                 params->length,
-                                 (dest_gpu ? dest_gpu->id : UVM_ID_CPU),
-                                 params->flags,
-                                 uvm_va_space_iter_first(va_space,
-                                                         params->base,
-                                                         params->base),
-                                 tracker_ptr);
+			UVM_ESCAL_PRINT("NV WARN NOTHING CASE. dest_gpu[%d] user_start[%d] user_length[%d] \n", dest_gpu, params->userSpaceStart, params->userSpaceLength);
+            
+			status = uvm_migrate_pageable(&uvm_migrate_args);
         }
     }
 

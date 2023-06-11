@@ -28,7 +28,6 @@
 #include "uvm_lock.h"
 #include "uvm_test.h"
 #include "uvm_va_space.h"
-#include "uvm_va_space_mm.h"
 #include "uvm_va_range.h"
 #include "uvm_va_block.h"
 #include "uvm_tools.h"
@@ -37,6 +36,7 @@
 #include "uvm_hmm.h"
 #include "uvm_mem.h"
 #include "uvm_kvmalloc.h"
+#include "uvm_escal_monitor.h"
 
 #define NVIDIA_UVM_DEVICE_NAME          "nvidia-uvm"
 
@@ -73,11 +73,6 @@ uvm_fd_type_t uvm_fd_type(struct file *filp, void **ptr_val)
             BUILD_BUG_ON(__alignof__(uvm_va_space_t) < (1UL << UVM_FD_TYPE_BITS));
             break;
 
-        case UVM_FD_MM:
-            UVM_ASSERT(ptr);
-            BUILD_BUG_ON(__alignof__(struct file) < (1UL << UVM_FD_TYPE_BITS));
-            break;
-
         default:
             UVM_ASSERT(0);
     }
@@ -88,106 +83,6 @@ uvm_fd_type_t uvm_fd_type(struct file *filp, void **ptr_val)
     return type;
 }
 
-void *uvm_fd_get_type(struct file *filp, uvm_fd_type_t type)
-{
-    void *ptr;
-
-    UVM_ASSERT(uvm_file_is_nvidia_uvm(filp));
-
-    if (uvm_fd_type(filp, &ptr) == type)
-        return ptr;
-    else
-        return NULL;
-}
-
-static NV_STATUS uvm_api_mm_initialize(UVM_MM_INITIALIZE_PARAMS *params, struct file *filp)
-{
-    uvm_va_space_t *va_space;
-    uvm_va_space_mm_t *va_space_mm;
-    struct file *uvm_file;
-    uvm_fd_type_t old_fd_type;
-    struct mm_struct *mm;
-    NV_STATUS status;
-
-    uvm_file = fget(params->uvmFd);
-    if (!uvm_file_is_nvidia_uvm(uvm_file)) {
-        status = NV_ERR_INVALID_ARGUMENT;
-        goto err;
-    }
-
-    if (uvm_fd_type(uvm_file, (void **)&va_space) != UVM_FD_VA_SPACE) {
-        status = NV_ERR_INVALID_ARGUMENT;
-        goto err;
-    }
-
-    // Tell userspace the MM FD is not required and it may be released
-    // with no loss of functionality.
-    if (!uvm_va_space_mm_enabled(va_space)) {
-        status = NV_WARN_NOTHING_TO_DO;
-        goto err;
-    }
-
-    old_fd_type = nv_atomic_long_cmpxchg((atomic_long_t *)&filp->private_data,
-                                         UVM_FD_UNINITIALIZED,
-                                         UVM_FD_INITIALIZING);
-    old_fd_type &= UVM_FD_TYPE_MASK;
-    if (old_fd_type != UVM_FD_UNINITIALIZED) {
-        status = NV_ERR_IN_USE;
-        goto err;
-    }
-
-    va_space_mm = &va_space->va_space_mm;
-    uvm_spin_lock(&va_space_mm->lock);
-    switch (va_space->va_space_mm.state) {
-        // We only allow the va_space_mm to be initialised once. If
-        // userspace passed the UVM FD to another process it is up to
-        // userspace to ensure it also passes the UVM MM FD that
-        // initialised the va_space_mm or arranges some other way to keep
-        // a reference on the FD.
-        case UVM_VA_SPACE_MM_STATE_ALIVE:
-            status = NV_ERR_INVALID_STATE;
-            goto err_release_unlock;
-            break;
-
-        // Once userspace has released the va_space_mm the GPU is
-        // effectively dead and no new work can be started. We don't
-        // support re-initializing once userspace has closed the FD.
-        case UVM_VA_SPACE_MM_STATE_RELEASED:
-            status = NV_ERR_PAGE_TABLE_NOT_AVAIL;
-            goto err_release_unlock;
-            break;
-
-        // Keep the warnings at bay
-        case UVM_VA_SPACE_MM_STATE_UNINITIALIZED:
-            mm = va_space->va_space_mm.mm;
-            if (!mm || !mmget_not_zero(mm)) {
-                status = NV_ERR_PAGE_TABLE_NOT_AVAIL;
-                goto err_release_unlock;
-            }
-
-            va_space_mm->state = UVM_VA_SPACE_MM_STATE_ALIVE;
-            break;
-
-        default:
-            UVM_ASSERT(0);
-            break;
-    }
-    uvm_spin_unlock(&va_space_mm->lock);
-    atomic_long_set_release((atomic_long_t *)&filp->private_data, (long)uvm_file | UVM_FD_MM);
-
-    return NV_OK;
-
-err_release_unlock:
-    uvm_spin_unlock(&va_space_mm->lock);
-    atomic_long_set_release((atomic_long_t *)&filp->private_data, UVM_FD_UNINITIALIZED);
-
-err:
-    if (uvm_file)
-        fput(uvm_file);
-
-    return status;
-}
-
 // Called when opening /dev/nvidia-uvm. This code doesn't take any UVM locks, so
 // there's no need to acquire g_uvm_global.pm.lock, but if that changes the PM
 // lock will need to be taken.
@@ -195,6 +90,7 @@ static int uvm_open(struct inode *inode, struct file *filp)
 {
     struct address_space *mapping;
     NV_STATUS status = uvm_global_get_status();
+	UVM_ESCAL_PRINT("Entry\n");
 
     if (status != NV_OK)
         return -nv_status_to_errno(status);
@@ -253,44 +149,22 @@ static void uvm_release_deferred(void *data)
     uvm_up_read(&g_uvm_global.pm.lock);
 }
 
-static void uvm_mm_release(struct file *filp, struct file *uvm_file)
-{
-    uvm_va_space_t *va_space = uvm_va_space_get(uvm_file);
-    uvm_va_space_mm_t *va_space_mm = &va_space->va_space_mm;
-    struct mm_struct *mm = va_space_mm->mm;
-
-    if (uvm_va_space_mm_enabled(va_space)) {
-        uvm_va_space_mm_unregister(va_space);
-
-        if (uvm_va_space_mm_enabled(va_space))
-            uvm_mmput(mm);
-
-        va_space_mm->mm = NULL;
-        fput(uvm_file);
-    }
-}
-
 static int uvm_release(struct inode *inode, struct file *filp)
 {
-    void *ptr;
     uvm_va_space_t *va_space;
     uvm_fd_type_t fd_type;
     int ret;
 
-    fd_type = uvm_fd_type(filp, &ptr);
+	UVM_ESCAL_PRINT("ENTRY\n");
+
+    fd_type = uvm_fd_type(filp, (void **)&va_space);
     UVM_ASSERT(fd_type != UVM_FD_INITIALIZING);
     if (fd_type == UVM_FD_UNINITIALIZED) {
         uvm_kvfree(filp->f_mapping);
         return 0;
     }
-    else if (fd_type == UVM_FD_MM) {
-        uvm_kvfree(filp->f_mapping);
-        uvm_mm_release(filp, (struct file *)ptr);
-        return 0;
-    }
 
     UVM_ASSERT(fd_type == UVM_FD_VA_SPACE);
-    va_space = (uvm_va_space_t *)ptr;
     filp->private_data = NULL;
     filp->f_mapping = NULL;
 
@@ -327,6 +201,8 @@ static void uvm_destroy_vma_managed(struct vm_area_struct *vma, bool make_zombie
 {
     uvm_va_range_t *va_range, *va_range_next;
     NvU64 size = 0;
+
+	UVM_ESCAL_PRINT("ENTRY\n");
 
     uvm_assert_rwsem_locked_write(&uvm_va_space_get(vma->vm_file)->lock);
     uvm_for_each_va_range_in_vma_safe(va_range, va_range_next, vma) {
@@ -404,6 +280,8 @@ static struct vm_operations_struct uvm_vm_ops_disabled =
 
 static void uvm_disable_vma(struct vm_area_struct *vma)
 {
+
+	UVM_ESCAL_PRINT("ENTRY\n");
     // In the case of fork, the kernel has already copied the old PTEs over to
     // the child process, so an access in the child might succeed instead of
     // causing a fault. To force a fault we'll unmap it directly here.
@@ -483,6 +361,8 @@ static void uvm_vm_open_managed(struct vm_area_struct *vma)
     NV_STATUS status;
     NvU64 new_end;
 
+	
+
     // This is slightly ugly. We need to know the parent vma of this new one,
     // but we can't use the range tree to look up the original because that
     // doesn't handle a vma move operation.
@@ -512,6 +392,8 @@ static void uvm_vm_open_managed(struct vm_area_struct *vma)
     // At this point we are guaranteed that the mmap_lock is held in write
     // mode.
     uvm_record_lock_mmap_lock_write(current->mm);
+
+	UVM_ESCAL_PRINT("ENTRY. vm_start[%d] vm_end[%d]\n", vma->vm_start, vma->vm_end);
 
     // Split vmas should always fall entirely within the old one, and be on one
     // side.
@@ -625,20 +507,51 @@ static void uvm_vm_close_managed_entry(struct vm_area_struct *vma)
 
 static vm_fault_t uvm_vm_fault(struct vm_area_struct *vma, struct vm_fault *vmf)
 {
+	UVM_MIGRATE_PARAMS params;
     uvm_va_space_t *va_space = uvm_va_space_get(vma->vm_file);
+	unsigned long offset = vmf->address - vmf->vma->vm_start;
 
-    return uvm_va_space_cpu_fault_managed(va_space, vma, vmf);
+	UVM_ESCAL_PRINT("Fault recieved.! vma[0x%x] vmf[0x%x] vm_start[0x%x] vm_end[0x%x]. vm_mm[0x%x] address[0x%x] pgoffset[0x%x] offset[0x%x]. IsWrite[%d]\n", vma, vmf, vma->vm_start, vma->vm_end, vma->vm_mm, vmf->address, vmf->pgoff, offset, (vmf->flags & FAULT_FLAG_WRITE));
+   
+	/* won.hur : ESCAL MONITOR : I CAN add asynchronous migration here */
+	/*
+	 * NV_STATUS uvm_api_migrate(UVM_MIGRATE_PARAMS *params, struct file *filp)
+	 *
+	 *typedef struct
+	 {
+	 NvU64           base               NV_ALIGN_BYTES(8); // IN
+	 NvU64           length             NV_ALIGN_BYTES(8); // IN
+	 NvProcessorUuid destinationUuid;                      // IN
+	 NvU32           flags;                                // IN
+	 NvU64           semaphoreAddress   NV_ALIGN_BYTES(8); // IN
+	 NvU32           semaphorePayload;                     // IN
+	 NvU32           cpuNumaNode;                          // IN
+	 
+	 NvU64           userSpaceStart     NV_ALIGN_BYTES(8); // OUT
+	 NvU64           userSpaceLength    NV_ALIGN_BYTES(8); // OUT
+	 NV_STATUS       rmStatus;                             // OUT
+	 } UVM_MIGRATE_PARAMS; 
+
+	params.base =;
+	params.lenght;
+	params.destinationUuid; // from uvm_tools.c 
+	params.flags = 0x23b41f19;
+
+*/
+	
+	return uvm_va_space_cpu_fault_managed(va_space, vma, vmf);
 }
 
 static vm_fault_t uvm_vm_fault_entry(struct vm_area_struct *vma, struct vm_fault *vmf)
 {
+
     UVM_ENTRY_RET(uvm_vm_fault(vma, vmf));
 }
 
 static vm_fault_t uvm_vm_fault_wrapper(struct vm_fault *vmf)
 {
 #if defined(NV_VM_OPS_FAULT_REMOVED_VMA_ARG)
-    return uvm_vm_fault(vmf->vma, vmf);
+	return uvm_vm_fault(vmf->vma, vmf);
 #else
     return uvm_vm_fault(NULL, vmf);
 #endif
@@ -773,6 +686,8 @@ static int uvm_mmap(struct file *filp, struct vm_area_struct *vma)
     if (!va_space)
         return -EBADFD;
 
+	UVM_ESCAL_PRINT("ENTRY. vma[0x%x] vm_start[0x%x] vm_end[0x%x]\n", vma, vma->vm_start, vma->vm_end);
+
     // When the VA space is associated with an mm, all vmas under the VA space
     // must come from that mm.
     if (uvm_va_space_mm_enabled(va_space)) {
@@ -826,7 +741,7 @@ static int uvm_mmap(struct file *filp, struct vm_area_struct *vma)
     // of removing CPU mappings in the parent on fork()+exec(). Users can call
     // madvise(MDV_DOFORK) if the child process requires access to the
     // allocation.
-    nv_vm_flags_set(vma, VM_MIXEDMAP | VM_DONTEXPAND | VM_DONTCOPY);
+    vma->vm_flags |= VM_MIXEDMAP | VM_DONTEXPAND | VM_DONTCOPY;
 
     vma->vm_ops = &uvm_vm_ops_managed;
 
@@ -886,13 +801,6 @@ out:
     return ret;
 }
 
-bool uvm_vma_is_managed(struct vm_area_struct *vma)
-{
-    return vma->vm_ops == &uvm_vm_ops_disabled ||
-           vma->vm_ops == &uvm_vm_ops_managed ||
-           vma->vm_ops == &uvm_vm_ops_semaphore_pool;
-}
-
 static int uvm_mmap_entry(struct file *filp, struct vm_area_struct *vma)
 {
    UVM_ENTRY_RET(uvm_mmap(filp, vma));
@@ -941,9 +849,6 @@ static NV_STATUS uvm_api_initialize(UVM_INITIALIZE_PARAMS *params, struct file *
         else
             status = NV_OK;
     }
-    else if (old_fd_type == UVM_FD_MM) {
-        status = NV_ERR_INVALID_ARGUMENT;
-    }
     else {
         UVM_ASSERT(old_fd_type == UVM_FD_INITIALIZING);
         status = NV_ERR_BUSY_RETRY;
@@ -967,7 +872,6 @@ static long uvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
             return 0;
 
         UVM_ROUTE_CMD_STACK_NO_INIT_CHECK(UVM_INITIALIZE,                  uvm_api_initialize);
-        UVM_ROUTE_CMD_STACK_NO_INIT_CHECK(UVM_MM_INITIALIZE,               uvm_api_mm_initialize);
 
         UVM_ROUTE_CMD_STACK_INIT_CHECK(UVM_PAGEABLE_MEM_ACCESS,            uvm_api_pageable_mem_access);
         UVM_ROUTE_CMD_STACK_INIT_CHECK(UVM_PAGEABLE_MEM_ACCESS_ON_GPU,     uvm_api_pageable_mem_access_on_gpu);

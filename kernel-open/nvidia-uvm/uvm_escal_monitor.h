@@ -35,8 +35,14 @@ extern "C"
 /*----------------------------------------------------------------------------------------
 	Macro Definitions
 ----------------------------------------------------------------------------------------*/
-#ifndef
-#define UVM_ESCAL_PRINT()		printk()
+#ifndef UVM_ESCAL_PRINT
+#define UVM_ESCAL_PRINT(fmt, ...) \
+    printk("%s:%u %s[pid:%d]" fmt,               \
+         kbasename(__FILE__),                         \
+         __LINE__,                                    \
+         __FUNCTION__,                                \
+         current->pid,                                \
+         ##__VA_ARGS__)
 #endif
 
 /**
@@ -88,6 +94,8 @@ typedef struct
 int UVM_ESCAL_Init(void);
 int UVM_ESCAL_InitThread(void);
 
+/* Debug features */
+void UVM_ESCAL_MONITOR_PROC_PrintStatus(struct seq_file *s);
 
 /*----------------------------------------------------------------------------------------
 	Extern Variables

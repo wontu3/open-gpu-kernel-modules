@@ -48,8 +48,39 @@ static struct proc_dir_entry *uvm_proc_gpus;
 static struct proc_dir_entry *uvm_proc_cpu;
 static struct proc_dir_entry *uvm_proc_escal;
 
+struct rw_semaphore uvm_system_pm_lock;
+
+static const char *uvm_escal_monitor_status_messages[] =
+{
+	"disabled",
+	"offline",
+	"online_empty",
+	"online_busy",
+	"online_full",
+	"error",
+};
+
+
+static int
+nv_procfs_read_status(
+    struct seq_file *s,
+    void *v
+)
+{
+	seq_printf(s, "Works fine!\n");
+	// UVM_ESCAL_MONITOR_PROC_PrintStatus(s);
+
+    return 0;
+}
+
+NV_DEFINE_SINGLE_PROCFS_FILE_READ_ONLY(status, uvm_system_pm_lock);
+
+
 NV_STATUS uvm_procfs_init()
 {
+	struct proc_dir_entry *entry;
+	init_rwsem(&uvm_system_pm_lock);
+
     if (!uvm_procfs_is_enabled())
         return NV_OK;
 
@@ -69,8 +100,15 @@ NV_STATUS uvm_procfs_init()
     if (uvm_proc_cpu == NULL)
         return NV_ERR_OPERATING_SYSTEM;
 
+	entry = NV_CREATE_PROC_FILE("status", uvm_proc_escal, status, NULL);
+	if(entry == NULL)
+		return NV_ERR_OPERATING_SYSTEM;
+
     return NV_OK;
 }
+
+
+
 
 void uvm_procfs_exit()
 {

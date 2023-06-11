@@ -41,7 +41,7 @@
 #include "uvm_gpu_access_counters.h"
 #include "uvm_ats.h"
 #include "uvm_test.h"
-#include "uvm_conf_computing.h"
+#include "uvm_escal_monitor.h"
 
 #include "uvm_linux.h"
 
@@ -67,6 +67,21 @@ static uvm_user_channel_t *get_user_channel(uvm_rb_tree_node_t *node)
     return container_of(node, uvm_user_channel_t, instance_ptr.node);
 }
 
+static void fill_gpu_info(uvm_parent_gpu_t *parent_gpu, const UvmGpuInfo *gpu_info)
+{
+    char uuid_buffer[UVM_GPU_UUID_TEXT_BUFFER_LENGTH];
+
+    parent_gpu->rm_info = *gpu_info;
+
+    format_uuid_to_buffer(uuid_buffer, sizeof(uuid_buffer), &parent_gpu->uuid);
+    snprintf(parent_gpu->name,
+             sizeof(parent_gpu->name),
+             "ID %u: %s: %s",
+             uvm_id_value(parent_gpu->id),
+             parent_gpu->rm_info.name,
+             uuid_buffer);
+}
+
 static uvm_gpu_link_type_t get_gpu_link_type(UVM_LINK_TYPE link_type)
 {
     switch (link_type) {
@@ -80,68 +95,44 @@ static uvm_gpu_link_type_t get_gpu_link_type(UVM_LINK_TYPE link_type)
             return UVM_GPU_LINK_NVLINK_3;
         case UVM_LINK_TYPE_NVLINK_4:
             return UVM_GPU_LINK_NVLINK_4;
-        case UVM_LINK_TYPE_C2C:
-            return UVM_GPU_LINK_C2C;
         default:
             return UVM_GPU_LINK_INVALID;
     }
 }
 
-static void fill_gpu_info(uvm_parent_gpu_t *parent_gpu, const UvmGpuInfo *gpu_info)
-{
-    char uuid_buffer[UVM_GPU_UUID_TEXT_BUFFER_LENGTH];
-
-    parent_gpu->rm_info = *gpu_info;
-
-    parent_gpu->system_bus.link = get_gpu_link_type(gpu_info->sysmemLink);
-    UVM_ASSERT(parent_gpu->system_bus.link != UVM_GPU_LINK_INVALID);
-
-    parent_gpu->system_bus.link_rate_mbyte_per_s = gpu_info->sysmemLinkRateMBps;
-
-    if (gpu_info->systemMemoryWindowSize > 0) {
-        // memory_window_end is inclusive but uvm_gpu_is_coherent() checks
-        // memory_window_end > memory_window_start as its condition.
-        UVM_ASSERT(gpu_info->systemMemoryWindowSize > 1);
-        parent_gpu->system_bus.memory_window_start = gpu_info->systemMemoryWindowStart;
-        parent_gpu->system_bus.memory_window_end   = gpu_info->systemMemoryWindowStart +
-                                                     gpu_info->systemMemoryWindowSize - 1;
-    }
-
-    parent_gpu->nvswitch_info.is_nvswitch_connected = gpu_info->connectedToSwitch;
-
-    // nvswitch is routed via physical pages, where the upper 13-bits of the
-    // 47-bit address space holds the routing information for each peer.
-    // Currently, this is limited to a 16GB framebuffer window size.
-    if (parent_gpu->nvswitch_info.is_nvswitch_connected)
-        parent_gpu->nvswitch_info.fabric_memory_window_start = gpu_info->nvswitchMemoryWindowStart;
-
-    format_uuid_to_buffer(uuid_buffer, sizeof(uuid_buffer), &parent_gpu->uuid);
-    snprintf(parent_gpu->name,
-             sizeof(parent_gpu->name),
-             "ID %u: %s: %s",
-             uvm_id_value(parent_gpu->id),
-             parent_gpu->rm_info.name,
-             uuid_buffer);
-}
-
-static NV_STATUS get_gpu_caps(uvm_gpu_t *gpu)
+static NV_STATUS get_gpu_caps(uvm_parent_gpu_t *parent_gpu)
 {
     NV_STATUS status;
     UvmGpuCaps gpu_caps;
 
     memset(&gpu_caps, 0, sizeof(gpu_caps));
 
-    status = uvm_rm_locked_call(nvUvmInterfaceQueryCaps(uvm_gpu_device_handle(gpu), &gpu_caps));
+    status = uvm_rm_locked_call(nvUvmInterfaceQueryCaps(parent_gpu->rm_device, &gpu_caps));
     if (status != NV_OK)
         return status;
 
+    parent_gpu->sysmem_link = get_gpu_link_type(gpu_caps.sysmemLink);
+    UVM_ASSERT(parent_gpu->sysmem_link != UVM_GPU_LINK_INVALID);
+
+    parent_gpu->sysmem_link_rate_mbyte_per_s = gpu_caps.sysmemLinkRateMBps;
+    parent_gpu->nvswitch_info.is_nvswitch_connected = gpu_caps.connectedToSwitch;
+
+    // nvswitch is routed via physical pages, where the upper 13-bits of the
+    // 47-bit address space holds the routing information for each peer.
+    // Currently, this is limited to a 16GB framebuffer window size.
+    if (parent_gpu->nvswitch_info.is_nvswitch_connected)
+        parent_gpu->nvswitch_info.fabric_memory_window_start = gpu_caps.nvswitchMemoryWindowStart;
+
     if (gpu_caps.numaEnabled) {
-        UVM_ASSERT(uvm_gpu_is_coherent(gpu->parent));
-        gpu->mem_info.numa.enabled = true;
-        gpu->mem_info.numa.node_id = gpu_caps.numaNodeId;
+        parent_gpu->numa_info.enabled = true;
+        parent_gpu->numa_info.node_id = gpu_caps.numaNodeId;
+        parent_gpu->numa_info.system_memory_window_start = gpu_caps.systemMemoryWindowStart;
+        parent_gpu->numa_info.system_memory_window_end = gpu_caps.systemMemoryWindowStart +
+                                                         gpu_caps.systemMemoryWindowSize -
+                                                         1;
     }
     else {
-        UVM_ASSERT(!uvm_gpu_is_coherent(gpu->parent));
+        UVM_ASSERT(!g_uvm_global.ats.enabled);
     }
 
     return NV_OK;
@@ -357,30 +348,26 @@ NvU64 uvm_parent_gpu_canonical_address(uvm_parent_gpu_t *parent_gpu, NvU64 addr)
 static void gpu_info_print_ce_caps(uvm_gpu_t *gpu, struct seq_file *s)
 {
     NvU32 i;
-    UvmGpuCopyEnginesCaps *ces_caps;
+    UvmGpuCopyEnginesCaps ces_caps;
     NV_STATUS status;
 
-    ces_caps = uvm_kvmalloc_zero(sizeof(*ces_caps));
-    if (!ces_caps) {
-        UVM_SEQ_OR_DBG_PRINT(s, "supported_ces: unavailable (no memory)\n");
-        return;
-    }
+    memset(&ces_caps, 0, sizeof(ces_caps));
+    status = uvm_rm_locked_call(nvUvmInterfaceQueryCopyEnginesCaps(uvm_gpu_device_handle(gpu), &ces_caps));
 
-    status = uvm_rm_locked_call(nvUvmInterfaceQueryCopyEnginesCaps(uvm_gpu_device_handle(gpu), ces_caps));
     if (status != NV_OK) {
         UVM_SEQ_OR_DBG_PRINT(s, "supported_ces: unavailable (query failed)\n");
-        goto out;
+        return;
     }
 
     UVM_SEQ_OR_DBG_PRINT(s, "supported_ces:\n");
     for (i = 0; i < UVM_COPY_ENGINE_COUNT_MAX; ++i) {
-        UvmGpuCopyEngineCaps *ce_caps = ces_caps->copyEngineCaps + i;
+        UvmGpuCopyEngineCaps *ce_caps = ces_caps.copyEngineCaps + i;
 
         if (!ce_caps->supported)
             continue;
 
-        UVM_SEQ_OR_DBG_PRINT(s, " ce %u pce mask 0x%08x grce %u shared %u sysmem read %u sysmem write %u sysmem %u "
-                             "nvlink p2p %u p2p %u\n",
+        UVM_SEQ_OR_DBG_PRINT(s, " ce %u pce mask 0x%08x grce %u shared %u sysmem read %u sysmem write %u sysmem %u nvlink p2p %u "
+                             "p2p %u\n",
                              i,
                              ce_caps->cePceMask,
                              ce_caps->grce,
@@ -391,9 +378,6 @@ static void gpu_info_print_ce_caps(uvm_gpu_t *gpu, struct seq_file *s)
                              ce_caps->nvlinkP2p,
                              ce_caps->p2p);
     }
-
-out:
-    uvm_kvfree(ces_caps);
 }
 
 static const char *uvm_gpu_virt_type_string(UVM_VIRT_MODE virtMode)
@@ -411,7 +395,7 @@ static const char *uvm_gpu_virt_type_string(UVM_VIRT_MODE virtMode)
 
 static const char *uvm_gpu_link_type_string(uvm_gpu_link_type_t link_type)
 {
-    BUILD_BUG_ON(UVM_GPU_LINK_MAX != 7);
+    BUILD_BUG_ON(UVM_GPU_LINK_MAX != 6);
 
     switch (link_type) {
         UVM_ENUM_STRING_CASE(UVM_GPU_LINK_INVALID);
@@ -420,7 +404,6 @@ static const char *uvm_gpu_link_type_string(uvm_gpu_link_type_t link_type)
         UVM_ENUM_STRING_CASE(UVM_GPU_LINK_NVLINK_2);
         UVM_ENUM_STRING_CASE(UVM_GPU_LINK_NVLINK_3);
         UVM_ENUM_STRING_CASE(UVM_GPU_LINK_NVLINK_4);
-        UVM_ENUM_STRING_CASE(UVM_GPU_LINK_C2C);
         UVM_ENUM_STRING_DEFAULT();
     }
 }
@@ -428,6 +411,7 @@ static const char *uvm_gpu_link_type_string(uvm_gpu_link_type_t link_type)
 static void gpu_info_print_common(uvm_gpu_t *gpu, struct seq_file *s)
 {
     const UvmGpuInfo *gpu_info = &gpu->parent->rm_info;
+    uvm_numa_info_t *numa_info = &gpu->parent->numa_info;
     NvU64 num_pages_in;
     NvU64 num_pages_out;
     NvU64 mapped_cpu_pages_size;
@@ -446,9 +430,9 @@ static void gpu_info_print_common(uvm_gpu_t *gpu, struct seq_file *s)
         return;
 
     UVM_SEQ_OR_DBG_PRINT(s, "CPU link type                          %s\n",
-                         uvm_gpu_link_type_string(gpu->parent->system_bus.link));
+                         uvm_gpu_link_type_string(gpu->parent->sysmem_link));
     UVM_SEQ_OR_DBG_PRINT(s, "CPU link bandwidth                     %uMBps\n",
-                         gpu->parent->system_bus.link_rate_mbyte_per_s);
+                         gpu->parent->sysmem_link_rate_mbyte_per_s);
 
     UVM_SEQ_OR_DBG_PRINT(s, "architecture                           0x%X\n", gpu_info->gpuArch);
     UVM_SEQ_OR_DBG_PRINT(s, "implementation                         0x%X\n", gpu_info->gpuImplementation);
@@ -470,13 +454,13 @@ static void gpu_info_print_common(uvm_gpu_t *gpu, struct seq_file *s)
                          gpu->mem_info.max_allocatable_address,
                          gpu->mem_info.max_allocatable_address / (1024 * 1024));
 
-    if (gpu->mem_info.numa.enabled) {
-        NvU64 window_size = gpu->parent->system_bus.memory_window_end - gpu->parent->system_bus.memory_window_start + 1;
-        UVM_SEQ_OR_DBG_PRINT(s, "numa_node_id                           %u\n", uvm_gpu_numa_node(gpu));
-        UVM_SEQ_OR_DBG_PRINT(s, "memory_window_start                    0x%llx\n",
-                             gpu->parent->system_bus.memory_window_start);
-        UVM_SEQ_OR_DBG_PRINT(s, "memory_window_end                      0x%llx\n",
-                             gpu->parent->system_bus.memory_window_end);
+    if (numa_info->enabled) {
+        NvU64 window_size = numa_info->system_memory_window_end - numa_info->system_memory_window_start + 1;
+        UVM_SEQ_OR_DBG_PRINT(s, "numa_node_id                           %u\n", numa_info->node_id);
+        UVM_SEQ_OR_DBG_PRINT(s, "system_memory_window_start             0x%llx\n",
+                             numa_info->system_memory_window_start);
+        UVM_SEQ_OR_DBG_PRINT(s, "system_memory_window_end               0x%llx\n",
+                             numa_info->system_memory_window_end);
         UVM_SEQ_OR_DBG_PRINT(s, "system_memory_window_size              0x%llx (%llu MBs)\n",
                              window_size,
                              window_size / (1024 * 1024));
@@ -567,10 +551,6 @@ static void gpu_info_print_common(uvm_gpu_t *gpu, struct seq_file *s)
 
     gpu_info_print_ce_caps(gpu, s);
 
-    if (uvm_conf_computing_mode_enabled(gpu)) {
-        UVM_SEQ_OR_DBG_PRINT(s, "dma_buffer_pool_num_buffers             %lu\n",
-                             gpu->conf_computing.dma_buffer_pool.num_dma_buffers);
-    }
 }
 
 static void
@@ -864,7 +844,7 @@ static void deinit_procfs_peer_cap_files(uvm_gpu_peer_t *peer_caps)
     proc_remove(peer_caps->procfs.peer_file[1]);
 }
 
-static NV_STATUS init_semaphore_pools(uvm_gpu_t *gpu)
+static NV_STATUS init_semaphore_pool(uvm_gpu_t *gpu)
 {
     NV_STATUS status;
     uvm_gpu_t *other_gpu;
@@ -873,17 +853,7 @@ static NV_STATUS init_semaphore_pools(uvm_gpu_t *gpu)
     if (status != NV_OK)
         return status;
 
-    // When the Confidential Computing feature is enabled, a separate secure
-    // pool is created that holds page allocated in the CPR of vidmem.
-    if (uvm_conf_computing_mode_enabled(gpu)) {
-        status = uvm_gpu_semaphore_secure_pool_create(gpu, &gpu->secure_semaphore_pool);
-        if (status != NV_OK)
-            return status;
-    }
-
     for_each_global_gpu(other_gpu) {
-        if (uvm_conf_computing_mode_enabled(gpu))
-            break;
         if (other_gpu == gpu)
             continue;
         status = uvm_gpu_semaphore_pool_map_gpu(other_gpu->semaphore_pool, gpu);
@@ -891,10 +861,12 @@ static NV_STATUS init_semaphore_pools(uvm_gpu_t *gpu)
             return status;
     }
 
+	UVM_ESCAL_PRINT("sema[0x%x]\n", gpu->semaphore_pool);
+
     return NV_OK;
 }
 
-static void deinit_semaphore_pools(uvm_gpu_t *gpu)
+static void deinit_semaphore_pool(uvm_gpu_t *gpu)
 {
     uvm_gpu_t *other_gpu;
 
@@ -905,7 +877,6 @@ static void deinit_semaphore_pools(uvm_gpu_t *gpu)
     }
 
     uvm_gpu_semaphore_pool_destroy(gpu->semaphore_pool);
-    uvm_gpu_semaphore_pool_destroy(gpu->secure_semaphore_pool);
 }
 
 static NV_STATUS find_unused_global_gpu_id(uvm_parent_gpu_t *parent_gpu, uvm_global_gpu_id_t *out_id)
@@ -1099,13 +1070,6 @@ static NV_STATUS init_parent_gpu(uvm_parent_gpu_t *parent_gpu,
         return status;
     }
 
-    status = uvm_conf_computing_init_parent_gpu(parent_gpu);
-    if (status != NV_OK) {
-        UVM_ERR_PRINT("Confidential computing: %s, GPU %s\n",
-                      nvstatusToString(status), parent_gpu->name);
-        return status;
-    }
-
     parent_gpu->pci_dev = gpu_platform_info->pci_dev;
     parent_gpu->closest_cpu_numa_node = dev_to_node(&parent_gpu->pci_dev->dev);
     parent_gpu->dma_addressable_start = gpu_platform_info->dma_addressable_start;
@@ -1140,6 +1104,12 @@ static NV_STATUS init_parent_gpu(uvm_parent_gpu_t *parent_gpu,
     parent_gpu->smc.enabled = !!parent_gpu->rm_info.smcEnabled;
 
     uvm_mmu_init_gpu_chunk_sizes(parent_gpu);
+
+    status = get_gpu_caps(parent_gpu);
+    if (status != NV_OK) {
+        UVM_ERR_PRINT("Failed to get GPU caps: %s, GPU %s\n", nvstatusToString(status), parent_gpu->name);
+        return status;
+    }
 
     status = uvm_ats_add_gpu(parent_gpu);
     if (status != NV_OK) {
@@ -1199,12 +1169,6 @@ static NV_STATUS init_gpu(uvm_gpu_t *gpu, const UvmGpuInfo *gpu_info)
         return status;
     }
 
-    status = get_gpu_caps(gpu);
-    if (status != NV_OK) {
-        UVM_ERR_PRINT("Failed to get GPU caps: %s, GPU %s\n", nvstatusToString(status), uvm_gpu_name(gpu));
-        return status;
-    }
-
     uvm_mmu_init_gpu_peer_addresses(gpu);
 
     status = alloc_and_init_address_space(gpu);
@@ -1237,7 +1201,7 @@ static NV_STATUS init_gpu(uvm_gpu_t *gpu, const UvmGpuInfo *gpu_info)
         return status;
     }
 
-    status = init_semaphore_pools(gpu);
+    status = init_semaphore_pool(gpu);
     if (status != NV_OK) {
         UVM_ERR_PRINT("Failed to initialize the semaphore pool: %s, GPU %s\n",
                       nvstatusToString(status),
@@ -1264,14 +1228,6 @@ static NV_STATUS init_gpu(uvm_gpu_t *gpu, const UvmGpuInfo *gpu_info)
     status = uvm_mmu_create_flat_mappings(gpu);
     if (status != NV_OK) {
         UVM_ERR_PRINT("Creating flat mappings failed: %s, GPU %s\n", nvstatusToString(status), uvm_gpu_name(gpu));
-        return status;
-    }
-
-    status = uvm_conf_computing_gpu_init(gpu);
-    if (status != NV_OK) {
-        UVM_ERR_PRINT("Failed to initialize Confidential Compute: %s for GPU %s\n",
-                      nvstatusToString(status),
-                      uvm_gpu_name(gpu));
         return status;
     }
 
@@ -1450,8 +1406,6 @@ static void remove_gpus_from_gpu(uvm_gpu_t *gpu)
     // Sync all trackers in PMM
     uvm_pmm_gpu_sync(&gpu->pmm);
 
-    // Sync all trackers in the GPU's DMA allocation pool
-    uvm_conf_computing_dma_buffer_pool_sync(&gpu->conf_computing.dma_buffer_pool);
 }
 
 // Remove all references to the given GPU from its parent, since it is being
@@ -1534,7 +1488,7 @@ static void deinit_gpu(uvm_gpu_t *gpu)
     // pain during development.
     deconfigure_address_space(gpu);
 
-    deinit_semaphore_pools(gpu);
+    deinit_semaphore_pool(gpu);
 
     uvm_pmm_sysmem_mappings_deinit(&gpu->pmm_reverse_sysmem_mappings);
 
@@ -1584,13 +1538,6 @@ static void remove_gpu(uvm_gpu_t *gpu)
     // comment on discover_nvlink_peers in add_gpu.
     if (free_parent)
         destroy_nvlink_peers(gpu);
-
-    // uvm_mem_free and other uvm_mem APIs invoked by the Confidential Compute
-    // deinitialization must be called before the GPU is removed from the global
-    // table.
-    //
-    // TODO: Bug 2008200: Add and remove the GPU in a more reasonable spot.
-    uvm_conf_computing_gpu_deinit(gpu);
 
     // TODO: Bug 2844714: If the parent is not being freed, the following
     // gpu_table_lock is only needed to protect concurrent
@@ -2269,12 +2216,9 @@ static NV_STATUS init_peer_access(uvm_gpu_t *gpu0,
 {
     NV_STATUS status;
 
-    UVM_ASSERT(p2p_caps_params->p2pLink != UVM_LINK_TYPE_C2C);
-
     // check for peer-to-peer compatibility (PCI-E or NvLink).
     peer_caps->link_type = get_gpu_link_type(p2p_caps_params->p2pLink);
     if (peer_caps->link_type == UVM_GPU_LINK_INVALID
-        || peer_caps->link_type == UVM_GPU_LINK_C2C
         )
         return NV_ERR_NOT_SUPPORTED;
 
@@ -2284,8 +2228,8 @@ static NV_STATUS init_peer_access(uvm_gpu_t *gpu0,
     peer_caps->is_indirect_peer = (p2p_caps_params->indirectAccess == NV_TRUE);
 
     if (peer_caps->is_indirect_peer) {
-        UVM_ASSERT(gpu0->mem_info.numa.enabled);
-        UVM_ASSERT(gpu1->mem_info.numa.enabled);
+        UVM_ASSERT(gpu0->parent->numa_info.enabled);
+        UVM_ASSERT(gpu1->parent->numa_info.enabled);
 
         status = uvm_pmm_gpu_indirect_peer_init(&gpu0->pmm, gpu1);
         if (status != NV_OK)
@@ -2474,7 +2418,8 @@ static NV_STATUS discover_nvlink_peers(uvm_gpu_t *gpu)
 
         // Indirect peers are only supported when onlined as NUMA nodes, because
         // we want to use vm_insert_page and dma_map_page.
-        if (p2p_caps_params.indirectAccess && (!gpu->mem_info.numa.enabled || !other_gpu->mem_info.numa.enabled))
+        if (p2p_caps_params.indirectAccess &&
+            (!gpu->parent->numa_info.enabled || !other_gpu->parent->numa_info.enabled))
             continue;
 
         status = enable_nvlink_peer_access(gpu, other_gpu, &p2p_caps_params);
@@ -2657,9 +2602,6 @@ uvm_aperture_t uvm_gpu_page_tree_init_location(const uvm_gpu_t *gpu)
 {
     // See comment in page_tree_set_location
     if (uvm_gpu_is_virt_mode_sriov_heavy(gpu))
-        return UVM_APERTURE_VID;
-
-    if (uvm_conf_computing_mode_enabled(gpu))
         return UVM_APERTURE_VID;
 
     return UVM_APERTURE_DEFAULT;
@@ -3252,6 +3194,9 @@ NV_STATUS uvm_api_register_gpu(UVM_REGISTER_GPU_PARAMS *params, struct file *fil
         .user_client   = params->hClient,
         .user_object   = params->hSmcPartRef,
     };
+
+
+	UVM_ESCAL_PRINT(" Uuid[0x%x]\n", params->gpu_uuid);
 
     return uvm_va_space_register_gpu(va_space,
                                      &params->gpu_uuid,

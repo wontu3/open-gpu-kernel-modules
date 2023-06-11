@@ -87,22 +87,26 @@ int UVM_ESCAL_Init(void)
 int UVM_ESCAL_InitThread(void)
 {
 	int __ret = RET_ERROR;
+	UVM_ESCAL_MONITOR_DEVICE_HANDLER_T *_p = __sUvmEscalDevHandler;
 
 	do {
+		/* Pointer Check */
+		if(__p == NULL) break;
+
 		/* Restore HDMI Thread */
 		if(gUvmEscalThread.isAlive <= 0){
 			gUvmEscalThread.isAlive = 1;
-			gUvmEscalThread.pThread= kthread_create( (void *)__UVM_ESCAL_MONITOR_KTHREAD, 0, "uvm_escal_daemon");
+			gUvmEscalThread.pThread= kthread_create( (void *)__UVM_ESCAL_MONITOR_KTHREAD, _p, "uvm_escal_daemon");
 			if(gUvmEscalThread.pThread){
-				UVM_ESCAL_PRINT("[ESCAL][%s:%d] : Initialing monitor kdaemon\n", __FUNC__, __LINE__);
+				UVM_ESCAL_PRINT("initialing monitor kdaemon\n");
 				wake_up_process(gUvmEscalThread.pThread);
 			}else {
-				UVM_ESCAL_PRINT("[ESCAL][%s:%d] : Cannot create kdaemon\n", __FUNC__, __LINE__);
+				UVM_ESCAL_PRINT("cannot create kdaemon\n");
 				break;
 			}
 		}
 		else{
-			UVM_ESCAL_PRINT("[ESCAL][%s:%d] : Error! ESCAL kdaemon already activated\n", __FUNC__, __LINE__);
+			UVM_ESCAL_PRINT("error! kdaemon already activated\n");
 			break;
 		}
 
@@ -112,16 +116,45 @@ int UVM_ESCAL_InitThread(void)
 	return __ret;
 }
 
+void UVM_ESCAL_MONITOR_PROC_PrintStatus(struct seq_file *s)
+{
+
+}
 
 
 /*========================================================================================
  Static Function Implementation 
 ======================================================================================== */
 
-static void __UVM_ESCAL_MONITOR_KTHREAD(void)
+static void __UVM_ESCAL_MONITOR_KTHREAD(volatile UVM_ESCAL_MONITOR_DEVICE_HANDLER_T *pDevHandler)
 {
+	volatile UVM_ESCAL_MONITOR_DEVICE_HANDLER_T *_p = pDevHandler;
+
+	UVM_ESCAL_PRINT("kdaemon activated\n");
+	
+	/* Step 0. Set stamp to zero */
+	gUvmEscalThread.stamp = 0;
+
+	while(1)
+	{
+		/* Step 1. Check Force kill */
+		if(gUvmEscalThread.isAlive <= 0) {
+			UVM_ESCAL_PRINT("killed\n");
+			break;
+		}
+		
+		/* Describe main activity */
 
 
+
+		/* Step last : Stamps & Iterate */
+		gUvmEscalThread.stamp = 1;
+		msleep(gUvmEscalThread.mSleep);
+	}
+
+	/* Exit : with Stamps & Mark */
+	gUvmEscalThread.stamp = 0;
+	gUvmEscalThread.isAlive = 0;
 
 }
 
@@ -130,11 +163,11 @@ static void __UVM_ESCAL_MONITOR_Set_InitDevhandler(volatile UVM_ESCAL_MONITOR_DE
 	volatile UVM_ESCAL_MONITOR_DEVICE_HANDLER_T *_p = pDevHandler;
 
 	do {
-		UVM_ESCAL_PRINT("[ESCAL] : Initialize UVM ESCAL device handler\n");
+		UVM_ESCAL_PRINT("initialize uvm escal device handler\n");
 
 		/* Check Pointer */
 		if(_p == NULL) {
-			UVM_ESCAL_PRINT("[ESCAL][%s:%d] : Null Pointer\n", __FUNC__, __LINE__);
+			UVM_ESCAL_PRINT("null pointer\n");
 			break;
 		}
 
